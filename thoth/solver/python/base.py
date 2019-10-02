@@ -30,6 +30,10 @@ class SolverException(Exception):
     """Exception to be raised in Solver."""
 
 
+class NoReleasesFound(SolverException):
+    """Exception raised if no releases were found for the given package."""
+
+
 class Tokens(object):
     """Comparison token representation."""
 
@@ -271,9 +275,9 @@ class Solver(object):
 
             if not releases:
                 if graceful:
-                    _LOGGER.info("No releases found for package %s", dep.name)
+                    _LOGGER.info("No releases found for package %r", dep.name)
                 else:
-                    raise SolverException("No releases found for package {}".format(dep.name))
+                    raise NoReleasesFound("No releases found for package {!r}".format(dep.name))
 
             releases = [release for release in releases if release in dep]
             matching = sorted(releases, key=cmp_to_key(_compare_version_index_url))
@@ -306,6 +310,6 @@ def get_ecosystem_solver(ecosystem_name, parser_kwargs=None, fetcher_kwargs=None
 
     if ecosystem_name.lower() == "pypi":
         source = Source(url="https://pypi.org/simple", warehouse_api_url="https://pypi.org/pypi", warehouse=True)
-        return PythonSolver(parser_kwargs, fetcher_kwargs={"source": source})
+        return PythonSolver(parser_kwargs, fetcher_kwargs={"source": source, **(fetcher_kwargs or {})})
 
     raise NotImplementedError("Unknown ecosystem: {}".format(ecosystem_name))

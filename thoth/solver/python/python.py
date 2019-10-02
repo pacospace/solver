@@ -17,6 +17,9 @@
 
 """Dependency requirements solving for Python ecosystem."""
 
+import os
+import sys
+import time
 from collections import deque
 from contextlib import contextmanager
 import logging
@@ -24,6 +27,7 @@ import typing
 from shlex import quote
 from urllib.parse import urlparse
 
+import http
 import requests
 from thoth.analyzer import CommandError
 from thoth.analyzer import run_command
@@ -40,11 +44,16 @@ def _create_entry(entry: dict, source: Source = None) -> dict:
     """Filter and normalize the output of pipdeptree entry."""
     entry["package_name"] = entry["package"].pop("package_name")
     entry["package_version"] = entry["package"].pop("installed_version")
+    entry["requested_package_version"] = entry["package"].pop("requested_package_version", entry["package_version"])
 
     if source:
         entry["index_url"] = source.url
         entry["sha256"] = []
-        for item in source.get_package_hashes(entry["package_name"], entry["package_version"]):
+        try:
+            package_hashes = source.get_package_hashes(entry["package_name"], entry["package_version"])
+        except NotFound:
+            package_hashes = source.get_package_hashes(entry["package_name"], entry["requested_package_version"])
+        for item in package_hashes:
             entry["sha256"].append(item["sha256"])
 
     entry.pop("package")
@@ -70,31 +79,65 @@ def _should_resolve_subgraph(subgraph_check_api: str, package_name: str, package
     analyzing of "core" packages (like setuptools) where not needed as they
     can break installation environment.
     """
+    # This variable is expected to be set in deployment to guarantee solver name correctness for subgraph checks.
+    solver_name = os.environ["THOTH_SOLVER"]
     _LOGGER.info(
-        "Checking if the given dependency subgraph for package %r in version %r from index %r should be resolved",
+        "Checking if the given dependency subgraph for package %r in version %r from index %r should be resolved by %r",
         package_name,
         package_version,
         index_url,
+        solver_name,
     )
 
-    response = requests.get(
-        subgraph_check_api,
-        params={"package_name": package_name, "package_version": package_version, "index_url": index_url},
-    )
+    response = None
+    for i in range(10):
+        try:
+            response = requests.get(
+                subgraph_check_api,
+                params={
+                    "package_name": package_name,
+                    "package_version": package_version,
+                    "index_url": index_url,
+                    "solver_name": solver_name,
+                },
+            )
+        except requests.exceptions.ConnectionError as exc:
+            _LOGGER.warning("Client got disconnected, retrying: %s", str(exc))
+            # Retry after some time.
+            time.sleep(1)
+            continue
 
-    if response.status_code == 200:
+        if response.status_code in (200, 208):
+            break
+
+        _LOGGER.warning(
+            "Invalid response from subgraph check API %r, retrying (status code: %d): %r",
+            subgraph_check_api,
+            response.status_code,
+            response.text
+        )
+        # Retry after some time.
+        time.sleep(1)
+    else:
+        if response:
+            response.raise_for_status()
+
+        # We received ConnectionError only exceptions.
+        raise requests.exceptions.ConnectionError("Too many connection errors when performing sub-graph checks")
+
+    if response.status_code == http.HTTPStatus.OK:
         return True
-    elif response.status_code == 208:
-        # This is probably not the correct HTTP status code to be used here, but which one should be used?
+    elif response.status_code == http.HTTPStatus.ALREADY_REPORTED:
+        # FIXME This is probably not the correct HTTP status code to be used here, but which one should be used?
         return False
 
-    response.raise_for_status()
     raise ValueError(
         "Unreachable code - subgraph check API responded with unknown HTTP status "
-        "code %s for package %r in version %r from index %r",
+        "code %s for package %r in version %r from index %r, solver %r",
         package_name,
         package_version,
         index_url,
+        solver_name
     )
 
 
@@ -245,9 +288,19 @@ def _do_resolve_index(
             unresolved.append({"package_name": dependency.name, "version_spec": version_spec, "index": index_url})
         else:
             for version in resolved_versions:
-                entry = (dependency.name, version)
-                packages_seen.add(entry)
-                queue.append(entry)
+                if not subgraph_check_api or (
+                    subgraph_check_api and
+                    _should_resolve_subgraph(subgraph_check_api, dependency.name, version, index_url)
+                ):
+                    entry = (dependency.name, version)
+                    packages_seen.add(entry)
+                    queue.append(entry)
+                else:
+                    _LOGGER.info(
+                        "Direct dependency %r in version % from %r was already resolved in one "
+                        "of the previous solver runs based on sub-graph check",
+                        dependency.name, version, index_url
+                    )
 
     while queue:
         package_name, package_version = queue.pop()
@@ -270,6 +323,7 @@ def _do_resolve_index(
                     "version": package_version,
                     "type": "command_error",
                     "details": exc.to_dict(),
+                    "is_provided": source.provides_package_version(package_name, package_version),
                 }
             )
             continue
@@ -288,6 +342,7 @@ def _do_resolve_index(
             )
             continue
 
+        package_info["package"]["requested_package_version"] = package_version
         if package_info["package"]["installed_version"] != package_version:
             _LOGGER.warning(
                 "Requested to install version %r of package %r, but installed version is %r, error is not fatal",
@@ -336,10 +391,12 @@ def _do_resolve_index(
                 for version in resolved_versions:
                     # Did we check this package already - do not check indexes, we manually insert them.
                     seen_entry = (dependency_name, version)
-                    if (
-                        seen_entry not in packages_seen
-                        and subgraph_check_api
-                        and _should_resolve_subgraph(subgraph_check_api, dependency_name, version, index_url)
+                    if seen_entry not in packages_seen and (
+                        not subgraph_check_api
+                        or (
+                            subgraph_check_api
+                            and _should_resolve_subgraph(subgraph_check_api, dependency_name, version, index_url)
+                        )
                     ):
                         _LOGGER.debug(
                             "Adding package %r in version %r for next resolution round", dependency_name, version
@@ -362,8 +419,11 @@ def resolve(
     assert python_version in (2, 3), "Unknown Python version"
 
     if subgraph_check_api and not transitive:
-        _LOG.error("The check against subgraph API cannot be done if no transitive dependencies are resolved")
-        sys.exit(2)
+        _LOGGER.warning(
+            "The check against subgraph API cannot be done if no transitive dependencies are "
+            "resolved, sub-graph checks are turned off implicitly"
+        )
+        subgraph_check_api = None
 
     python_bin = "python3" if python_version == 3 else "python2"
     run_command("virtualenv -p python3 venv")
